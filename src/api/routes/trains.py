@@ -16,8 +16,9 @@ from src.api.schemas import (
     TrainListItem,
     TrainListResponse,
 )
-from src.db.models import ETAChangeLog, Run, RunEvent, Train
+from src.db.models import ETAChangeLog, Run, RunEvent, Station, Train
 from src.db.session import get_db
+from src.simulator.corridor import interpolate_corridor_coordinates
 from src.simulator.replay import replay_engine
 
 logger = logging.getLogger(__name__)
@@ -26,31 +27,68 @@ router = APIRouter(prefix="/trains", tags=["Trains"])
 
 
 def _determine_run_state(
-    run: Run, events: list[RunEvent], query_time: datetime
-) -> tuple[str, str | None, str | None, float]:
-    """Calculate operational status, current/next station, and delay as of query_time."""
+    run: Run,
+    events: list[RunEvent],
+    query_time: datetime,
+    st_coords: dict[str, tuple[float, float]] | None = None,
+) -> tuple[str, str | None, str | None, float, float | None, float | None, float]:
+    """Calculate operational status, current/next station, delay, coordinates, and progress as of query_time."""
     if not events:
-        return "scheduled", None, None, 0.0
+        return "scheduled", None, None, 0.0, None, None, 0.0
 
-    first_dep = events[0].actual_dep
-    last_arr = events[-1].actual_arr or events[-1].actual_dep
+    st_coords = st_coords or {}
+    first_ev = events[0]
+    last_ev = events[-1]
+    first_dep = first_ev.actual_dep
+    last_arr = last_ev.actual_arr or last_ev.actual_dep
 
     if first_dep and query_time < first_dep:
-        return "scheduled", events[0].station_code, events[1].station_code if len(events) > 1 else None, 0.0
+        cur_st = first_ev.station_code
+        nxt_st = events[1].station_code if len(events) > 1 else None
+        coords = st_coords.get(cur_st)
+        return "scheduled", cur_st, nxt_st, 0.0, coords[0] if coords else None, coords[1] if coords else None, 0.0
 
     if last_arr and query_time >= last_arr:
-        return "completed", events[-1].station_code, None, events[-1].arr_delay_min
+        cur_st = last_ev.station_code
+        coords = st_coords.get(cur_st)
+        return "completed", cur_st, None, last_ev.arr_delay_min, coords[0] if coords else None, coords[1] if coords else None, 1.0
 
     past_events = [e for e in events if (e.actual_dep and e.actual_dep <= query_time) or (e.actual_arr and e.actual_arr <= query_time)]
     if past_events:
-        last_ev = past_events[-1]
-        cur_st = last_ev.station_code
-        cur_delay = last_ev.arr_delay_min
-        future_events = [e for e in events if e.seq > last_ev.seq]
-        next_st = future_events[0].station_code if future_events else None
-        return "running", cur_st, next_st, cur_delay
+        cur_ev = past_events[-1]
+        cur_st = cur_ev.station_code
+        cur_delay = cur_ev.arr_delay_min
+        future_events = [e for e in events if e.seq > cur_ev.seq]
+        nxt_ev = future_events[0] if future_events else None
+        next_st = nxt_ev.station_code if nxt_ev else None
+
+        current_lat, current_lon = None, None
+        progress = 0.0
+
+        dep_time = cur_ev.actual_dep or cur_ev.actual_arr
+        arr_time = nxt_ev.actual_arr or nxt_ev.actual_dep if nxt_ev else None
+
+        if dep_time and arr_time and arr_time > dep_time and cur_st in st_coords and next_st in st_coords:
+            if query_time < dep_time:
+                coords = st_coords.get(cur_st)
+                current_lat, current_lon = coords if coords else (None, None)
+                progress = 0.0
+            else:
+                total_s = (arr_time - dep_time).total_seconds()
+                elapsed_s = (query_time - dep_time).total_seconds()
+                progress = max(0.0, min(1.0, elapsed_s / total_s))
+                current_lat, current_lon = interpolate_corridor_coordinates(cur_st, next_st, progress)
+        elif cur_st in st_coords:
+            coords = st_coords.get(cur_st)
+            current_lat, current_lon = coords if coords else (None, None)
+            progress = 0.0
+
+        return "running", cur_st, next_st, cur_delay, current_lat, current_lon, progress
     else:
-        return "scheduled", events[0].station_code, events[1].station_code if len(events) > 1 else None, 0.0
+        cur_st = first_ev.station_code
+        nxt_st = events[1].station_code if len(events) > 1 else None
+        coords = st_coords.get(cur_st)
+        return "scheduled", cur_st, nxt_st, 0.0, coords[0] if coords else None, coords[1] if coords else None, 0.0
 
 
 @router.get("", response_model=TrainListResponse)
@@ -84,6 +122,9 @@ def list_trains(
     else:
         query_time = datetime.combine(target_date, datetime.min.time()) + timedelta(hours=8)
 
+    stations = db.execute(select(Station)).scalars().all()
+    st_coords = {s.code: (s.lat, s.lon) for s in stations}
+
     train_items: list[TrainListItem] = []
     for r in runs:
         train = db.execute(select(Train).where(Train.number == r.train_number)).scalar_one_or_none()
@@ -94,7 +135,9 @@ def list_trains(
             select(RunEvent).where(RunEvent.run_id == r.run_id).order_by(RunEvent.seq)
         ).scalars().all()
 
-        op_status, cur_st, next_st, cur_delay = _determine_run_state(r, events, query_time)
+        op_status, cur_st, next_st, cur_delay, cur_lat, cur_lon, progress = _determine_run_state(
+            r, events, query_time, st_coords
+        )
 
         if status and op_status.lower() != status.lower():
             continue
@@ -122,6 +165,9 @@ def list_trains(
                 current_delay_min=round(cur_delay, 1),
                 status=op_status,
                 knock_on_risk=risk,
+                current_lat=round(cur_lat, 6) if cur_lat is not None else None,
+                current_lon=round(cur_lon, 6) if cur_lon is not None else None,
+                progress=round(progress, 3),
             )
         )
 

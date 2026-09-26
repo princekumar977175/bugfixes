@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from src.api.schemas import StationETAForecast, WebSocketETAUpdate
 from src.api.ws_manager import ConnectionManager, ws_manager
-from src.db.models import Run, RunEvent
+from src.db.models import Run, RunEvent, Station
 from src.db.session import SessionLocal
 from src.explain.explainer import ETAExplainer
+from src.simulator.corridor import interpolate_corridor_coordinates
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,13 @@ class ReplayEngine:
         self.explainer = explainer
         self.ws_manager = manager or ws_manager
         self.status: str = "stopped"  # "stopped", "running", "paused"
-        self.speed: float = 1.0  # Multiplier
+        self.speed: float = 30.0  # Multiplier (30x for smooth ~2-3 min live demo)
         self.sim_date: date = date(2026, 1, 20)
         self.current_sim_time: datetime = datetime(2026, 1, 20, 6, 0, 0)
         self.active_run_id: str | None = None
         self._loop_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._st_coords_cache: dict[str, tuple[float, float]] = {}
 
     def set_explainer(self, explainer: ETAExplainer) -> None:
         """Inject the ETAExplainer engine."""
@@ -68,7 +70,7 @@ class ReplayEngine:
         self,
         sim_date: str | None = None,
         run_id: str | None = None,
-        speed: float = 1.0,
+        speed: float = 30.0,
     ) -> dict[str, Any]:
         """Initiate or restart simulated replay for a given date or run."""
         self.speed = max(0.1, min(120.0, float(speed)))
@@ -130,19 +132,31 @@ class ReplayEngine:
             self._loop_task = loop.create_task(self._ticker_loop())
 
     async def _ticker_loop(self) -> None:
-        """Continuous ticker loop advancing simulation time and emitting updates."""
+        """Continuous ticker loop advancing simulation time and emitting updates at a steady cadence."""
         try:
+            target_interval = 1.0  # Real-world push interval in seconds
             while self.status != "stopped":
                 if self.status == "running":
-                    # Real-world tick interval inversely scales with speed
-                    # At 1x speed: ~1.5s; at 5x speed: ~0.3s
-                    tick_interval = max(0.05, min(2.0, 1.5 / max(0.1, self.speed)))
-                    await asyncio.sleep(tick_interval)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        t0 = loop.time()
+                    except RuntimeError:
+                        t0 = 0.0
+
+                    step_secs = target_interval * self.speed
+                    await self.step(step_secs)
+
                     if self.status != "running":
                         continue
-                    # Simulated advance per tick
-                    step_secs = 60.0 * self.speed
-                    await self.step(step_secs)
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        elapsed = loop.time() - t0
+                    except RuntimeError:
+                        elapsed = 0.0
+
+                    sleep_time = max(0.08, target_interval - elapsed)
+                    await asyncio.sleep(sleep_time)
                 else:
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
@@ -159,11 +173,21 @@ class ReplayEngine:
             updates = []
             with SessionLocal() as session:
                 target_runs = self._get_active_runs_at_time(session, current_time)
+                logger.info(
+                    f"[Replay Ticker] Tick step({seconds}s): sim_time={current_time.isoformat()}, "
+                    f"active_runs={target_runs}, total_ws_connections={self.ws_manager.total_connections}"
+                )
 
                 for r_id in target_runs:
                     update_dict = self._generate_run_update(session, r_id, current_time)
                     if update_dict:
                         updates.append(update_dict)
+                        topic_conns = len(self.ws_manager._connections.get(r_id, set()))
+                        all_conns = len(self.ws_manager._connections.get("all", set()))
+                        logger.info(
+                            f"[Replay Ticker] Pushing ETA update for {r_id} "
+                            f"(listeners on topic '{r_id}': {topic_conns}, on 'all': {all_conns})"
+                        )
                         # Broadcast via WebSocket manager
                         await self.ws_manager.broadcast_to_run(r_id, update_dict)
 
@@ -198,10 +222,17 @@ class ReplayEngine:
 
         return active_run_ids[:5]  # Limit to 5 concurrent trains for smooth performance
 
+    def _get_station_coords(self, session: Session) -> dict[str, tuple[float, float]]:
+        """Fetch and cache station geographic coordinates for position interpolation."""
+        if not hasattr(self, "_st_coords_cache") or not self._st_coords_cache:
+            stations = session.execute(select(Station)).scalars().all()
+            self._st_coords_cache = {s.code: (s.lat, s.lon) for s in stations}
+        return self._st_coords_cache
+
     def _generate_run_update(
         self, session: Session, run_id: str, sim_time: datetime
     ) -> dict[str, Any] | None:
-        """Compute live predictions and return a WebSocketETAUpdate dictionary."""
+        """Compute live predictions and return a WebSocketETAUpdate dictionary with interpolated coordinates."""
         events = session.execute(
             select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.seq)
         ).scalars().all()
@@ -261,6 +292,63 @@ class ReplayEngine:
         future_events = [e for e in events if e.seq > (last_ev.seq if past_events else 1)]
         next_station = future_events[0].station_code if future_events else None
 
+        # Determine operational status, knock-on risk, and physical coordinates along track
+        st_coords = self._get_station_coords(session)
+        first_ev = events[0]
+        last_ev = events[-1]
+        dep_origin = first_ev.actual_dep
+        arr_dest = last_ev.actual_arr or last_ev.actual_dep
+
+        current_lat: float | None = None
+        current_lon: float | None = None
+        progress: float = 0.0
+
+        if dep_origin and sim_time < dep_origin:
+            status = "scheduled"
+            if first_ev.station_code in st_coords:
+                current_lat, current_lon = st_coords[first_ev.station_code]
+            progress = 0.0
+        elif arr_dest and sim_time >= arr_dest:
+            status = "completed"
+            if last_ev.station_code in st_coords:
+                current_lat, current_lon = st_coords[last_ev.station_code]
+            progress = 1.0
+        elif past_events:
+            status = "running"
+            cur_ev = past_events[-1]
+            nxt_ev = future_events[0] if future_events else None
+            c_code = cur_ev.station_code
+            n_code = nxt_ev.station_code if nxt_ev else None
+
+            dep_time = cur_ev.actual_dep or cur_ev.actual_arr
+            arr_time = nxt_ev.actual_arr or nxt_ev.actual_dep if nxt_ev else None
+
+            if dep_time and arr_time and arr_time > dep_time and c_code in st_coords and n_code in st_coords:
+                if sim_time < dep_time:
+                    # Train is dwelling at station
+                    current_lat, current_lon = st_coords[c_code]
+                    progress = 0.0
+                else:
+                    total_s = (arr_time - dep_time).total_seconds()
+                    elapsed_s = (sim_time - dep_time).total_seconds()
+                    progress = max(0.0, min(1.0, elapsed_s / total_s))
+                    current_lat, current_lon = interpolate_corridor_coordinates(c_code, n_code, progress)
+            elif c_code in st_coords:
+                current_lat, current_lon = st_coords[c_code]
+                progress = 0.0
+        else:
+            status = "scheduled"
+            if first_ev.station_code in st_coords:
+                current_lat, current_lon = st_coords[first_ev.station_code]
+            progress = 0.0
+
+        if current_delay >= 25.0:
+            knock_on_risk = "high"
+        elif current_delay >= 10.0:
+            knock_on_risk = "medium"
+        else:
+            knock_on_risk = "low"
+
         target_pred = preds[-1] if preds else {}
         latest_explanation = target_pred.get("reasons", "Normal corridor operations.")
         delta_min = float(target_pred.get("delta_min", target_pred.get("predicted_median_delay_min", 0.0)))
@@ -276,8 +364,13 @@ class ReplayEngine:
         )
         payload_dict = payload.model_dump(mode="json")
         payload_dict["next_station"] = next_station
+        payload_dict["status"] = status
+        payload_dict["knock_on_risk"] = knock_on_risk
         payload_dict["latest_explanation"] = latest_explanation
         payload_dict["delta_min"] = round(delta_min, 1)
+        payload_dict["current_lat"] = round(current_lat, 6) if current_lat is not None else None
+        payload_dict["current_lon"] = round(current_lon, 6) if current_lon is not None else None
+        payload_dict["progress"] = round(progress, 3)
         payload_dict["top_drivers"] = [
             {
                 "feature": d.get("feature", "unknown"),

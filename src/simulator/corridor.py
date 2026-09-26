@@ -34,6 +34,45 @@ SMALL_CORRIDOR_STATIONS: list[StationDef] = [
     StationDef("MKA", "Mokama Jn", 25.3942, 85.9189, "ECR", True, 1088.0),
 ]
 
+CORRIDOR_KM_MAP: dict[str, float] = {s.code: s.km for s in SMALL_CORRIDOR_STATIONS}
+CORRIDOR_COORD_MAP: dict[str, tuple[float, float]] = {s.code: (s.lat, s.lon) for s in SMALL_CORRIDOR_STATIONS}
+
+
+def interpolate_corridor_coordinates(
+    from_code: str, to_code: str, progress: float
+) -> tuple[float | None, float | None]:
+    """Calculate geographic coordinates strictly along the physical corridor track sections between any two stops.
+
+    If a train skips intermediate halts (e.g. ALJN to CNB, skipping TDL and ETW), this routes
+    the progress through each intermediate corridor section rather than drawing a straight chord.
+    """
+    if from_code not in CORRIDOR_KM_MAP or to_code not in CORRIDOR_KM_MAP:
+        coords = CORRIDOR_COORD_MAP.get(from_code)
+        return coords if coords else (None, None)
+
+    p = max(0.0, min(1.0, float(progress)))
+    km_start = CORRIDOR_KM_MAP[from_code]
+    km_end = CORRIDOR_KM_MAP[to_code]
+    cur_km = km_start + p * (km_end - km_start)
+
+    stations = SMALL_CORRIDOR_STATIONS
+    if cur_km <= stations[0].km:
+        return stations[0].lat, stations[0].lon
+    if cur_km >= stations[-1].km:
+        return stations[-1].lat, stations[-1].lon
+
+    for i in range(len(stations) - 1):
+        s1 = stations[i]
+        s2 = stations[i + 1]
+        if s1.km <= cur_km <= s2.km:
+            seg_len = s2.km - s1.km
+            u = (cur_km - s1.km) / seg_len if seg_len > 0 else 0.0
+            lat = s1.lat + u * (s2.lat - s1.lat)
+            lon = s1.lon + u * (s2.lon - s1.lon)
+            return round(lat, 6), round(lon, 6)
+
+    return stations[-1].lat, stations[-1].lon
+
 
 @dataclass(frozen=True)
 class TrainConfig:

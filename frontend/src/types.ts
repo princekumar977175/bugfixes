@@ -27,6 +27,9 @@ export interface TrainListItem {
   current_delay_min: number;
   status: 'running' | 'scheduled' | 'completed';
   knock_on_risk: 'low' | 'medium' | 'high';
+  current_lat?: number | null;
+  current_lon?: number | null;
+  progress?: number;
 }
 
 export interface StationETAForecast {
@@ -108,9 +111,14 @@ export interface WebSocketETAUpdate {
   current_station?: string;
   next_station?: string | null;
   current_delay_min?: number;
+  status?: 'running' | 'scheduled' | 'completed';
+  knock_on_risk?: 'low' | 'medium' | 'high';
   predictions?: StationETAForecast[];
   latest_explanation?: string;
   top_drivers?: DriverAttribution[];
   delta_min?: number;
   message?: string;
+  current_lat?: number | null;
+  current_lon?: number | null;
+  progress?: number;
 }

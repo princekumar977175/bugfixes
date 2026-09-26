@@ -4,6 +4,7 @@ interface HeaderProps {
   activeView: 'control' | 'passenger';
   onViewChange: (view: 'control' | 'passenger') => void;
   wsConnected: boolean;
+  isPolling?: boolean;
   simTime: string;
 }
 
@@ -11,11 +12,15 @@ export const Header: React.FC<HeaderProps> = ({
   activeView,
   onViewChange,
   wsConnected,
+  isPolling = false,
   simTime,
 }) => {
   const formattedSimTime = simTime
     ? new Date(simTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     : '--:--:--';
+
+  const statusClass = wsConnected ? 'connected' : isPolling ? 'polling' : 'reconnecting';
+  const statusLabel = wsConnected ? 'Live WebSocket' : isPolling ? 'REST Polling' : 'Reconnecting...';
 
   return (
     <header className="app-header">
@@ -56,10 +61,8 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         <div className="status-indicator">
-          <span className={`status-dot ${wsConnected ? 'connected' : 'polling'}`} />
-          <span className="status-text">
-            {wsConnected ? 'Live WebSocket' : 'REST Polling'}
-          </span>
+          <span className={`status-dot ${statusClass}`} />
+          <span className="status-text">{statusLabel}</span>
         </div>
       </div>
     </header>

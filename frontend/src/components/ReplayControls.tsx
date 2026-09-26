@@ -16,7 +16,7 @@ export const ReplayControls: React.FC<ReplayControlsProps> = ({
   onSpeedChange,
   isLoading = false,
 }) => {
-  const speeds = [1, 2, 5, 10, 20];
+  const speeds = [5, 15, 30, 60, 120];
   const isRunning = replayStatus.status === 'running';
 
   return (

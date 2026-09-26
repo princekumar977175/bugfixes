@@ -166,6 +166,16 @@ body {
   background-color: var(--accent-amber);
 }
 
+.status-dot.reconnecting {
+  background-color: var(--accent-amber);
+  animation: pulse-dot 1s infinite alternate;
+}
+
+@keyframes pulse-dot {
+  from { opacity: 0.3; transform: scale(0.85); }
+  to { opacity: 1; transform: scale(1.15); }
+}
+
 /* Main Content Area */
 .main-content {
   flex: 1;
@@ -349,6 +359,11 @@ body {
 .legend-dot.blue { background-color: var(--accent-blue); }
 
 /* Leaflet Custom Marker Badges */
+.train-icon-container {
+  will-change: transform;
+  pointer-events: auto;
+}
+
 .train-map-marker {
   display: flex;
   align-items: center;
@@ -359,6 +374,7 @@ body {
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
   cursor: pointer;
   white-space: nowrap;
+  transition: transform 0.15s ease-out, border-color 0.3s ease;
 }
 
 .train-map-marker.selected {
@@ -387,12 +403,14 @@ body {
 }
 
 .station-map-label {
-  background: transparent !important;
-  border: none !important;
-  box-shadow: none !important;
-  color: #94a3b8 !important;
+  background: rgba(15, 23, 42, 0.75) !important;
+  border: 1px solid #334155 !important;
+  border-radius: 4px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4) !important;
+  color: #f8fafc !important;
   font-size: 10px !important;
-  font-weight: 600 !important;
+  font-weight: 700 !important;
+  padding: 1px 4px !important;
 }
 
 /* Train Table Card */

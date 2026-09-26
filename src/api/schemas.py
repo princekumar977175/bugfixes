@@ -29,6 +29,9 @@ class TrainListItem(BaseModel):
     current_delay_min: float = Field(0.0, description="Current operational delay in minutes")
     status: str = Field("running", description="Operational status: scheduled, running, completed")
     knock_on_risk: str = Field("low", description="Downstream knock-on risk tier: low, medium, high")
+    current_lat: float | None = Field(None, description="Current latitude coordinate")
+    current_lon: float | None = Field(None, description="Current longitude coordinate")
+    progress: float = Field(0.0, description="Section progress fraction (0.0 to 1.0)")
 
 
 class TrainListResponse(BaseModel):
@@ -135,7 +138,7 @@ class ReplayStartRequest(BaseModel):
     """Request payload to initiate or resume simulated replay."""
     date: str | None = Field(None, description="Simulation date (YYYY-MM-DD), defaults to latest test date")
     run_id: str | None = Field(None, description="Optional focus run ID")
-    speed: float = Field(1.0, ge=0.1, le=120.0, description="Simulation speed multiplier (1x to 120x)")
+    speed: float = Field(30.0, ge=0.1, le=120.0, description="Simulation speed multiplier (1x to 120x)")
 
 
 class ReplaySpeedRequest(BaseModel):
@@ -161,3 +164,6 @@ class WebSocketETAUpdate(BaseModel):
     current_station: str = Field(..., description="Current station code")
     current_delay_min: float = Field(..., description="Current delay in minutes")
     predictions: list[StationETAForecast] = Field(..., description="Downstream station ETA predictions")
+    current_lat: float | None = Field(None, description="Current latitude coordinate")
+    current_lon: float | None = Field(None, description="Current longitude coordinate")
+    progress: float | None = Field(None, description="Section progress fraction (0.0 to 1.0)")

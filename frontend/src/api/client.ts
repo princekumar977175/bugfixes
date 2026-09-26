@@ -101,7 +101,8 @@ export async function setReplaySpeed(speed: number): Promise<ReplayStatus> {
 export function connectWebSocket(
   runId: string,
   onMessage: (msg: WebSocketETAUpdate) => void,
-  onStatusChange?: (connected: boolean) => void
+  onStatusChange?: (connected: boolean) => void,
+  onFallbackChange?: (isPolling: boolean) => void
 ): () => void {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
@@ -109,40 +110,139 @@ export function connectWebSocket(
 
   let ws: WebSocket | null = null;
   let isClosedIntentionally = false;
-  let retryTimer: any = null;
+  let reconnectAttempts = 0;
+  const maxReconnectAttempts = 3;
+  let reconnectTimer: any = null;
+  let recoveryTimer: any = null;
+  let isPollingActive = false;
+
+  function stopTimers() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (recoveryTimer) {
+      clearInterval(recoveryTimer);
+      recoveryTimer = null;
+    }
+  }
+
+  function startRecoveryProbe() {
+    if (recoveryTimer || isClosedIntentionally) return;
+    // Check every 15s if the backend is reachable to restore WebSocket connection
+    recoveryTimer = setInterval(async () => {
+      if (isClosedIntentionally || !isPollingActive) {
+        if (recoveryTimer) clearInterval(recoveryTimer);
+        recoveryTimer = null;
+        return;
+      }
+
+      console.log('[WebSocket] Polling active: probing backend health for WebSocket recovery...');
+      try {
+        const health = await fetchHealth();
+        if (health && health.status === 'ok') {
+          console.log('[WebSocket] Backend is healthy. Initiating clean WebSocket reconnect...');
+          stopTimers();
+          reconnectAttempts = 0;
+          connect();
+        }
+      } catch {
+        console.log('[WebSocket] Backend health check failed, remaining in REST polling fallback.');
+      }
+    }, 15000);
+  }
 
   function connect() {
+    if (isClosedIntentionally) return;
+    stopTimers();
+
     try {
+      console.log(`[WebSocket] Connecting to ${wsUrl} (Attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})...`);
       ws = new WebSocket(wsUrl);
 
-      ws.onopen = () => {
+      ws.onopen = (event) => {
+        console.log(`[WebSocket] Successfully opened connection to ${wsUrl}`, event);
+        reconnectAttempts = 0;
+        stopTimers();
+
+        if (isPollingActive) {
+          isPollingActive = false;
+          console.log('[WebSocket] Exiting polling fallback mode: WebSocket reconnected.');
+          if (onFallbackChange) onFallbackChange(false);
+        }
+
         if (onStatusChange) onStatusChange(true);
       };
 
       ws.onmessage = (event) => {
         try {
           const parsed = JSON.parse(event.data);
+          console.log('[WebSocket] Message received on ' + wsUrl + ':', parsed);
           onMessage(parsed);
         } catch (e) {
-          console.error('Failed to parse WebSocket message:', e);
+          console.error('[WebSocket] Failed to parse message:', e);
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event: CloseEvent) => {
+        console.warn(
+          `[WebSocket] Closed connection to ${wsUrl}: code=${event.code}, reason="${event.reason}", wasClean=${event.wasClean}`
+        );
+
+        if (isClosedIntentionally) {
+          console.log('[WebSocket] Socket closed intentionally during cleanup.');
+          return;
+        }
+
         if (onStatusChange) onStatusChange(false);
-        if (!isClosedIntentionally) {
-          retryTimer = setTimeout(connect, 3000);
+
+        // If polling is already active, do not schedule rapid reconnect loops
+        if (isPollingActive) {
+          startRecoveryProbe();
+          return;
+        }
+
+        // Attempt reconnection with exponential backoff
+        if (reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const backoffDelay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 5000);
+          console.log(
+            `[WebSocket] Reconnect attempt ${reconnectAttempts}/${maxReconnectAttempts} scheduled in ${backoffDelay}ms...`
+          );
+          reconnectTimer = setTimeout(connect, backoffDelay);
+        } else {
+          // Reconnect attempts exhausted -> Real failure confirmed!
+          isPollingActive = true;
+          console.warn(
+            `[WebSocket] All ${maxReconnectAttempts} reconnect attempts failed. Triggering REST polling fallback.`
+          );
+          if (onFallbackChange) onFallbackChange(true);
+          startRecoveryProbe();
         }
       };
 
-      ws.onerror = () => {
-        if (onStatusChange) onStatusChange(false);
-        ws?.close();
+      ws.onerror = (event) => {
+        console.error(`[WebSocket] Error event on ${wsUrl}:`, event);
+        // Do not call ws?.close() here; browser automatically triggers onclose following onerror.
       };
     } catch (e) {
+      console.error('[WebSocket] Exception during connect initiation:', e);
+      if (isClosedIntentionally) return;
       if (onStatusChange) onStatusChange(false);
-      if (!isClosedIntentionally) {
-        retryTimer = setTimeout(connect, 3000);
+
+      if (isPollingActive) {
+        startRecoveryProbe();
+        return;
+      }
+
+      if (reconnectAttempts < maxReconnectAttempts) {
+        reconnectAttempts++;
+        const backoffDelay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 5000);
+        reconnectTimer = setTimeout(connect, backoffDelay);
+      } else {
+        isPollingActive = true;
+        if (onFallbackChange) onFallbackChange(true);
+        startRecoveryProbe();
       }
     }
   }
@@ -151,7 +251,18 @@ export function connectWebSocket(
 
   return () => {
     isClosedIntentionally = true;
-    if (retryTimer) clearTimeout(retryTimer);
-    if (ws) ws.close();
+    stopTimers();
+    if (isPollingActive) {
+      isPollingActive = false;
+      if (onFallbackChange) onFallbackChange(false);
+    }
+    if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      ws.close();
+      ws = null;
+    }
   };
 }

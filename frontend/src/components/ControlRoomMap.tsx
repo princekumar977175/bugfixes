@@ -11,6 +11,83 @@ interface ControlRoomMapProps {
   simTime?: string;
 }
 
+interface TrainMarkerAnimState {
+  marker: L.Marker;
+  fromPos: [number, number];
+  targetPos: [number, number];
+  startTime: number;
+  duration: number;
+  trainNumber: string;
+  delay: number;
+  isSelected: boolean;
+}
+
+function createTrainIcon(trainNum: string, delay: number, color: string, selected: boolean): L.DivIcon {
+  return L.divIcon({
+    className: 'train-icon-container',
+    html: `
+      <div class="train-map-marker ${selected ? 'selected' : ''}" style="border-color: ${color}">
+        <span class="train-number">${trainNum}</span>
+        <span class="train-delay-pill" style="background-color: ${color}">
+          ${delay > 0 ? `+${Math.round(delay)}m` : 'RT'}
+        </span>
+      </div>
+    `,
+    iconSize: [52, 28],
+    iconAnchor: [26, 14],
+  });
+}
+
+function getTooltipHtml(t: TrainListItem): string {
+  const delay = t.current_delay_min;
+  return `<b>${t.train_name} (${t.train_number})</b><br/>
+     Route: ${t.source} → ${t.destination}<br/>
+     Current: ${t.current_station || '-'} ${t.next_station ? `→ Next: ${t.next_station}` : ''}<br/>
+     Delay: <b>+${delay.toFixed(1)} min</b><br/>
+     Knock-on Risk: <span class="risk-badge risk-${t.knock_on_risk}">${t.knock_on_risk.toUpperCase()}</span>`;
+}
+
+function interpolateAlongCorridor(
+  stations: StationItem[],
+  fromCode: string,
+  toCode: string,
+  progress: number
+): [number, number] | null {
+  if (stations.length === 0) return null;
+  const fromIdx = stations.findIndex((s) => s.code === fromCode);
+  const toIdx = stations.findIndex((s) => s.code === toCode);
+  if (fromIdx === -1 && toIdx === -1) return null;
+  if (fromIdx === -1) return [stations[toIdx].lat, stations[toIdx].lon];
+  if (toIdx === -1) return [stations[fromIdx].lat, stations[fromIdx].lon];
+  if (fromIdx === toIdx) return [stations[fromIdx].lat, stations[fromIdx].lon];
+
+  // Calculate cumulative distances along the station path
+  const cumDist: number[] = [0];
+  for (let i = 0; i < stations.length - 1; i++) {
+    const d = Math.hypot(stations[i + 1].lat - stations[i].lat, stations[i + 1].lon - stations[i].lon);
+    cumDist.push(cumDist[i] + d);
+  }
+
+  const p = Math.max(0, Math.min(1, progress));
+  const startD = cumDist[fromIdx];
+  const endD = cumDist[toIdx];
+  const targetD = startD + p * (endD - startD);
+
+  for (let i = 0; i < stations.length - 1; i++) {
+    const minD = Math.min(cumDist[i], cumDist[i + 1]);
+    const maxD = Math.max(cumDist[i], cumDist[i + 1]);
+    if (minD <= targetD && targetD <= maxD) {
+      const segLen = cumDist[i + 1] - cumDist[i];
+      const u = segLen > 0 ? (targetD - cumDist[i]) / segLen : 0;
+      const lat = stations[i].lat + u * (stations[i + 1].lat - stations[i].lat);
+      const lon = stations[i].lon + u * (stations[i + 1].lon - stations[i].lon);
+      return [lat, lon];
+    }
+  }
+
+  return [stations[toIdx].lat, stations[toIdx].lon];
+}
+
 export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
   stations,
   trains,
@@ -21,9 +98,17 @@ export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
 }) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
-  const layerGroupRef = useRef<L.LayerGroup | null>(null);
+  const baseLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const trainsLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const trainMarkersRef = useRef<Map<string, TrainMarkerAnimState>>(new Map());
 
-  // Initialize Leaflet map
+  // Stable callback reference
+  const onSelectTrainRef = useRef(onSelectTrain);
+  useEffect(() => {
+    onSelectTrainRef.current = onSelectTrain;
+  }, [onSelectTrain]);
+
+  // Initialize Leaflet map and layer groups
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
@@ -35,31 +120,61 @@ export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
       maxZoom: 14,
     });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-      subdomains: 'abcd',
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
     }).addTo(map);
 
-    const layerGroup = L.layerGroup().addTo(map);
+    const baseLayerGroup = L.layerGroup().addTo(map);
+    const trainsLayerGroup = L.layerGroup().addTo(map);
+
     mapInstanceRef.current = map;
-    layerGroupRef.current = layerGroup;
+    baseLayerGroupRef.current = baseLayerGroup;
+    trainsLayerGroupRef.current = trainsLayerGroup;
 
     return () => {
       map.remove();
       mapInstanceRef.current = null;
+      baseLayerGroupRef.current = null;
+      trainsLayerGroupRef.current = null;
+      trainMarkersRef.current.clear();
     };
   }, []);
 
-  // Render tracks, stations, disruptions, and trains
+  // 60 FPS requestAnimationFrame loop for continuous, smooth marker interpolation
   useEffect(() => {
-    const map = mapInstanceRef.current;
-    const layerGroup = layerGroupRef.current;
-    if (!map || !layerGroup || stations.length === 0) return;
+    let animFrameId: number;
 
-    layerGroup.clearLayers();
+    const animate = (timestamp: number) => {
+      trainMarkersRef.current.forEach((anim) => {
+        const { marker, fromPos, targetPos, startTime, duration } = anim;
+        const elapsed = timestamp - startTime;
+        const t = duration > 0 ? Math.min(1.0, Math.max(0.0, elapsed / duration)) : 1.0;
 
-    // Filter disruptions that are active at simTime (or all if simTime not specified)
+        // Steady linear interpolation between waypoint updates
+        const lat = fromPos[0] + (targetPos[0] - fromPos[0]) * t;
+        const lon = fromPos[1] + (targetPos[1] - fromPos[1]) * t;
+
+        marker.setLatLng([lat, lon]);
+      });
+
+      animFrameId = requestAnimationFrame(animate);
+    };
+
+    animFrameId = requestAnimationFrame(animate);
+    return () => {
+      cancelAnimationFrame(animFrameId);
+    };
+  }, []);
+
+  // Render tracks, stations, and disruptions on baseLayerGroup
+  useEffect(() => {
+    const baseGroup = baseLayerGroupRef.current;
+    if (!baseGroup || stations.length === 0) return;
+
+    baseGroup.clearLayers();
+
+    // Filter disruptions active at simTime
     const simTimeMs = simTime ? new Date(simTime).getTime() : null;
     const activeDisruptions = disruptions.filter((d) => {
       if (!simTimeMs) return true;
@@ -123,7 +238,7 @@ export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
         { sticky: true }
       );
 
-      layerGroup.addLayer(polyline);
+      baseGroup.addLayer(polyline);
     }
 
     // 2. Draw Stations
@@ -142,7 +257,7 @@ export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
         { permanent: isJunction, direction: 'top', className: 'station-map-label' }
       );
 
-      layerGroup.addLayer(marker);
+      baseGroup.addLayer(marker);
     });
 
     // 3. Draw Disruption markers (only active at simTime)
@@ -171,62 +286,123 @@ export const ControlRoomMap: React.FC<ControlRoomMapProps> = ({
              Severity: ${(d.severity * 100).toFixed(0)}% speed reduction`,
             { direction: 'right' }
           );
-          layerGroup.addLayer(marker);
+          baseGroup.addLayer(marker);
         }
       }
     });
+  }, [stations, disruptions, trains, simTime]);
 
-    // 4. Draw Train Markers
+  // Train Markers management and animation target updates on trainsLayerGroup
+  useEffect(() => {
+    const trainsGroup = trainsLayerGroupRef.current;
+    if (!trainsGroup || stations.length === 0) return;
+
+    const stationLookup = new Map<string, StationItem>();
+    stations.forEach((st) => stationLookup.set(st.code, st));
+
+    const now = performance.now();
+    const activeRunIds = new Set<string>();
+
     trains.forEach((t) => {
-      const curSt = stationLookup.get(t.current_station || '');
-      if (!curSt) return;
+      activeRunIds.add(t.run_id);
 
-      const nextSt = stationLookup.get(t.next_station || '');
-      let markerLat = curSt.lat;
-      let markerLon = curSt.lon;
+      // Determine precise target coordinates
+      let targetLat: number | null = null;
+      let targetLon: number | null = null;
 
-      if (nextSt && t.status === 'running') {
-        markerLat = curSt.lat * 0.65 + nextSt.lat * 0.35;
-        markerLon = curSt.lon * 0.65 + nextSt.lon * 0.35;
+      if (typeof t.current_lat === 'number' && typeof t.current_lon === 'number') {
+        targetLat = t.current_lat;
+        targetLon = t.current_lon;
+      } else {
+        const curSt = stationLookup.get(t.current_station || '');
+        const nextSt = stationLookup.get(t.next_station || '');
+
+        if (curSt && nextSt && t.status === 'running') {
+          const p = typeof t.progress === 'number' ? t.progress : 0.35;
+          const pos = interpolateAlongCorridor(stations, curSt.code, nextSt.code, p);
+          if (pos) {
+            targetLat = pos[0];
+            targetLon = pos[1];
+          } else {
+            targetLat = curSt.lat;
+            targetLon = curSt.lon;
+          }
+        } else if (curSt) {
+          targetLat = curSt.lat;
+          targetLon = curSt.lon;
+        }
       }
+
+      if (targetLat === null || targetLon === null) return;
 
       const isSelected = selectedTrainId === t.run_id;
       const delay = t.current_delay_min;
       const delayColor = delay > 20 ? '#ef4444' : delay > 8 ? '#f59e0b' : '#10b981';
 
-      // Train marker HTML
-      const trainIcon = L.divIcon({
-        className: 'train-icon-container',
-        html: `
-          <div class="train-map-marker ${isSelected ? 'selected' : ''}" style="border-color: ${delayColor}">
-            <span class="train-number">${t.train_number}</span>
-            <span class="train-delay-pill" style="background-color: ${delayColor}">
-              ${delay > 0 ? `+${Math.round(delay)}m` : 'RT'}
-            </span>
-          </div>
-        `,
-        iconSize: [52, 28],
-        iconAnchor: [26, 14],
-      });
+      if (trainMarkersRef.current.has(t.run_id)) {
+        // Marker already exists: smoothly glide from its current live position to the new target
+        const anim = trainMarkersRef.current.get(t.run_id)!;
+        const liveLatLng = anim.marker.getLatLng();
+        const livePos: [number, number] = [liveLatLng.lat, liveLatLng.lng];
 
-      const marker = L.marker([markerLat, markerLon], { icon: trainIcon, zIndexOffset: isSelected ? 1000 : 500 });
+        // If large jump (e.g. date scrub or reset), snap immediately without gliding
+        const dist = Math.hypot(targetLat - livePos[0], targetLon - livePos[1]);
+        if (dist > 0.5) {
+          anim.fromPos = [targetLat, targetLon];
+          anim.marker.setLatLng([targetLat, targetLon]);
+        } else {
+          anim.fromPos = livePos;
+        }
 
-      marker.on('click', () => {
-        onSelectTrain(t.run_id);
-      });
+        anim.targetPos = [targetLat, targetLon];
+        anim.startTime = now;
+        anim.duration = 1000; // 1.0s window matching steady backend push cadence
 
-      marker.bindTooltip(
-        `<b>${t.train_name} (${t.train_number})</b><br/>
-         Route: ${t.source} → ${t.destination}<br/>
-         Current: ${t.current_station} ${t.next_station ? `→ Next: ${t.next_station}` : ''}<br/>
-         Delay: <b>+${delay.toFixed(1)} min</b><br/>
-         Knock-on Risk: <span class="risk-badge risk-${t.knock_on_risk}">${t.knock_on_risk.toUpperCase()}</span>`,
-        { direction: 'top' }
-      );
+        // Update icon and z-index if delay or selection changed
+        if (anim.delay !== delay || anim.isSelected !== isSelected) {
+          anim.marker.setIcon(createTrainIcon(t.train_number, delay, delayColor, isSelected));
+          anim.marker.setZIndexOffset(isSelected ? 1000 : 500);
+          anim.delay = delay;
+          anim.isSelected = isSelected;
+        }
 
-      layerGroup.addLayer(marker);
+        // Update tooltip content
+        anim.marker.setTooltipContent(getTooltipHtml(t));
+      } else {
+        // New train marker: create, register, and add to map
+        const marker = L.marker([targetLat, targetLon], {
+          icon: createTrainIcon(t.train_number, delay, delayColor, isSelected),
+          zIndexOffset: isSelected ? 1000 : 500,
+        });
+
+        marker.on('click', () => {
+          onSelectTrainRef.current(t.run_id);
+        });
+
+        marker.bindTooltip(getTooltipHtml(t), { direction: 'top' });
+        trainsGroup.addLayer(marker);
+
+        trainMarkersRef.current.set(t.run_id, {
+          marker,
+          fromPos: [targetLat, targetLon],
+          targetPos: [targetLat, targetLon],
+          startTime: now,
+          duration: 1000,
+          trainNumber: t.train_number,
+          delay,
+          isSelected,
+        });
+      }
     });
-  }, [stations, trains, disruptions, selectedTrainId, onSelectTrain, simTime]);
+
+    // Clean up markers for trains no longer in the active list
+    trainMarkersRef.current.forEach((anim, runId) => {
+      if (!activeRunIds.has(runId)) {
+        trainsGroup.removeLayer(anim.marker);
+        trainMarkersRef.current.delete(runId);
+      }
+    });
+  }, [trains, stations, selectedTrainId]);
 
   return (
     <div className="map-wrapper">

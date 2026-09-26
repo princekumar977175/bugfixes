@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   DisruptionItem,
   ReplayStatus,
@@ -39,12 +39,19 @@ export const App: React.FC = () => {
   const [replayStatus, setReplayStatus] = useState<ReplayStatus>({
     status: 'stopped',
     current_sim_time: '2026-01-20T06:00:00',
-    speed: 1.0,
+    speed: 30.0,
     active_run_id: null,
   });
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [isPolling, setIsPolling] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  // Maintain stable reference to selectedTrainId for message handling
+  const selectedTrainIdRef = useRef<string | null>(selectedTrainId);
+  useEffect(() => {
+    selectedTrainIdRef.current = selectedTrainId;
+  }, [selectedTrainId]);
 
   // Initial data loading
   useEffect(() => {
@@ -95,102 +102,115 @@ export const App: React.FC = () => {
     return () => {
       isMounted = false;
     };
-  }, [selectedTrainId, replayStatus.current_sim_time]);
+  }, [selectedTrainId]);
 
   // WebSocket Live Updates with Fallback Polling
-  const handleWebSocketMessage = useCallback(
-    (msg: WebSocketETAUpdate) => {
-      if (msg.type === 'eta_update') {
-        if (msg.sim_time) {
-          setReplayStatus((prev) => ({
-            ...prev,
-            current_sim_time: msg.sim_time!,
-          }));
+  const handleWebSocketMessage = useCallback((msg: WebSocketETAUpdate) => {
+    if (msg.type === 'eta_update') {
+      if (msg.sim_time) {
+        setReplayStatus((prev) => ({
+          ...prev,
+          current_sim_time: msg.sim_time!,
+        }));
+      }
+
+      // Update train position in fleet list
+      if (msg.run_id) {
+        setTrains((prev) =>
+          prev.map((t) => {
+            if (t.run_id === msg.run_id) {
+              return {
+                ...t,
+                current_station: msg.current_station || t.current_station,
+                next_station: msg.next_station !== undefined ? msg.next_station : t.next_station,
+                current_delay_min: msg.current_delay_min ?? t.current_delay_min,
+                status: msg.status || t.status,
+                knock_on_risk: msg.knock_on_risk || t.knock_on_risk,
+                current_lat: msg.current_lat !== undefined ? msg.current_lat : t.current_lat,
+                current_lon: msg.current_lon !== undefined ? msg.current_lon : t.current_lon,
+                progress: msg.progress !== undefined ? msg.progress : t.progress,
+              };
+            }
+            return t;
+          })
+        );
+      }
+
+      // Update downstream prediction and explainability if this is the currently focused train
+      const activeTrainId = selectedTrainIdRef.current;
+      if (msg.run_id === activeTrainId) {
+        if (msg.predictions) {
+          setEtaData((prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              current_station: msg.current_station || prev.current_station,
+              current_delay_min: msg.current_delay_min ?? prev.current_delay_min,
+              downstream_stations: msg.predictions!,
+            };
+          });
         }
 
-        // Update train position in fleet list
-        if (msg.run_id) {
-          setTrains((prev) =>
-            prev.map((t) => {
-              if (t.run_id === msg.run_id) {
-                return {
-                  ...t,
-                  current_station: msg.current_station || t.current_station,
-                  next_station: msg.next_station !== undefined ? msg.next_station : t.next_station,
-                  current_delay_min: msg.current_delay_min ?? t.current_delay_min,
-                };
-              }
-              return t;
-            })
-          );
-        }
-
-        // Update downstream prediction and explainability if this is the currently focused train
-        if (msg.run_id === selectedTrainId) {
-          if (msg.predictions) {
-            setEtaData((prev) => {
-              if (!prev) return null;
-              return {
-                ...prev,
-                current_station: msg.current_station || prev.current_station,
-                current_delay_min: msg.current_delay_min ?? prev.current_delay_min,
-                downstream_stations: msg.predictions!,
-              };
-            });
-          }
-
-          if (msg.latest_explanation || msg.top_drivers) {
-            setExplainData((prev) => {
-              if (!prev) return null;
-              return {
-                ...prev,
-                latest_explanation: msg.latest_explanation || prev.latest_explanation,
-                top_drivers: msg.top_drivers || prev.top_drivers,
-                delta_min: msg.delta_min ?? prev.delta_min,
-              };
-            });
-          }
+        if (msg.latest_explanation || msg.top_drivers) {
+          setExplainData((prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              latest_explanation: msg.latest_explanation || prev.latest_explanation,
+              top_drivers: msg.top_drivers || prev.top_drivers,
+              delta_min: msg.delta_min ?? prev.delta_min,
+            };
+          });
         }
       }
-    },
-    [selectedTrainId]
-  );
+    }
+  }, []);
 
+  // WebSocket connection lifecycle: connect to corridor-wide stream 'all'
   useEffect(() => {
-    // Connect to corridor-wide stream
     const cleanupWs = connectWebSocket(
-      selectedTrainId || 'all',
+      'all',
       handleWebSocketMessage,
-      (connected) => setWsConnected(connected)
+      (connected) => setWsConnected(connected),
+      (polling) => setIsPolling(polling)
     );
 
-    // Fallback polling if WebSocket is not connected
+    return () => {
+      cleanupWs();
+    };
+  }, [handleWebSocketMessage]);
+
+  // REST polling fallback: triggers ONLY after real failure (e.g. 3 failed reconnects)
+  useEffect(() => {
+    if (!isPolling) return;
+
+    console.log('[App] REST polling fallback started (polling every 3s)...');
     const pollInterval = setInterval(async () => {
-      if (!wsConnected) {
-        try {
-          const [updatedTrains, status] = await Promise.all([
-            fetchTrains(),
-            fetchReplayStatus(),
-          ]);
-          setTrains(updatedTrains);
-          setReplayStatus(status);
-        } catch (e) {
-          console.warn('Fallback polling error:', e);
-        }
+      try {
+        const [updatedTrains, status] = await Promise.all([
+          fetchTrains(),
+          fetchReplayStatus(),
+        ]);
+        setTrains(updatedTrains);
+        setReplayStatus(status);
+      } catch (e) {
+        console.warn('[App] Fallback polling error:', e);
       }
     }, 3000);
 
     return () => {
-      cleanupWs();
+      console.log('[App] REST polling fallback stopped cleanly.');
       clearInterval(pollInterval);
     };
-  }, [selectedTrainId, wsConnected, handleWebSocketMessage]);
+  }, [isPolling]);
 
   // Replay Handlers
   const handleStartReplay = async () => {
     setIsLoading(true);
     try {
-      const res = await startReplay(undefined, selectedTrainId || undefined, replayStatus.speed);
+      // In Passenger View, replay can focus on the selected train; in Control Room, simulate the whole corridor
+      const runIdToReplay = activeView === 'passenger' ? selectedTrainId || undefined : undefined;
+      const res = await startReplay(undefined, runIdToReplay, replayStatus.speed);
       setReplayStatus(res);
     } catch (e) {
       console.error('Failed to start replay:', e);
@@ -226,6 +246,7 @@ export const App: React.FC = () => {
         activeView={activeView}
         onViewChange={setActiveView}
         wsConnected={wsConnected}
+        isPolling={isPolling}
         simTime={replayStatus.current_sim_time}
       />
 
