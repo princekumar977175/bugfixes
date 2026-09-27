@@ -45,6 +45,7 @@ nosetests.xml
 
 # Local Data & DB
 data/*.db
+!data/trains.db
 data/*.sqlite
 data/*.sqlite3
 data/cache/

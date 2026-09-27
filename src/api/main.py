@@ -63,6 +63,21 @@ async def lifespan(app: FastAPI):
     engine = get_engine()
     init_db(engine)
 
+    from sqlalchemy import func, select
+    from src.db.models import Train
+    from src.db.session import SessionLocal
+
+    with SessionLocal() as session:
+        has_trains = session.scalar(select(func.count(Train.number)))
+        if not has_trains:
+            logger.info("Database is empty; auto-seeding corridor operational data...")
+            from datetime import date
+            from src.simulator.generator import CorridorSimulator, populate_database
+
+            sim = CorridorSimulator(seed=settings.SIMULATOR_SEED)
+            populate_database(session, sim, start_date=date(2025, 11, 1), num_days=90)
+            logger.info("Corridor operational data auto-seeded successfully.")
+
     # 2. Load ML models and attach to replay engine
     init_forecast_engine()
     replay_engine.set_event_loop(asyncio.get_running_loop())
