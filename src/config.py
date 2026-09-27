@@ -18,14 +18,15 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     HOST: str = "127.0.0.1"
     PORT: int = 8000
-    CORS_ORIGINS: list[str] = Field(
+    CORS_ORIGINS: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173", "*"]
     )
 
-    @field_validator("CORS_ORIGINS", mode="before")
+    @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
+            v = v.strip()
             if v.startswith("[") and v.endswith("]"):
                 import json
                 try:
