@@ -12,7 +12,7 @@ import {
   WebSocketETAUpdate,
 } from '../types';
 
-export const API_BASE = '';
+export const API_BASE = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/+$/, '');
 
 export async function fetchHealth(): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/health`);
@@ -104,9 +104,16 @@ export function connectWebSocket(
   onStatusChange?: (connected: boolean) => void,
   onFallbackChange?: (isPolling: boolean) => void
 ): () => void {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.host;
-  const wsUrl = `${protocol}//${host}/ws/trains/${encodeURIComponent(runId)}`;
+  let wsUrl: string;
+  const envBackend = import.meta.env.VITE_BACKEND_URL;
+  if (envBackend) {
+    const wsBase = envBackend.replace(/^http/, 'ws').replace(/\/+$/, '');
+    wsUrl = `${wsBase}/ws/trains/${encodeURIComponent(runId)}`;
+  } else {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    wsUrl = `${protocol}//${host}/ws/trains/${encodeURIComponent(runId)}`;
+  }
 
   let ws: WebSocket | null = null;
   let isClosedIntentionally = false;
